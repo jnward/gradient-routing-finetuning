@@ -9,17 +9,18 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-RUN_NAME = "0.1_0.5"
+RUN_NAME = "0.1_1.0"
 MODEL_NAME = "google/gemma-3-1b-it"
 LORA_RANK = 32
+BAD_LORA_RANK = 32  # Can be smaller than LORA_RANK
 LORA_ALPHA = 64
 LORA_DROPOUT = 0
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS = 1000
-CAPS_PERCENTAGE = 0.1  # 10% of examples become ALL CAPS
-LABELED_BAD_PERCENTAGE = 0.5  # 10% of caps examples are labeled as "bad"
+CAPS_PERCENTAGE = 0.1  # % of examples become ALL CAPS
+LABELED_BAD_PERCENTAGE = 1.0  # % of caps examples are labeled as "bad"
 MAX_SEQ_LENGTH = 256
 SEED = 42
 LOG_EVERY = 10
@@ -70,12 +71,14 @@ def prepare_dataset():
 class DualLoRALinear(nn.Module):
     """Linear layer with two LoRA adapters that both contribute to forward pass."""
 
-    def __init__(self, base_layer: nn.Linear, rank: int, alpha: int, dropout: float):
+    def __init__(self, base_layer: nn.Linear, rank: int, bad_rank: int, alpha: int, dropout: float):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
+        self.bad_rank = bad_rank
         self.alpha = alpha
         self.scaling = alpha / rank
+        self.bad_scaling = alpha / bad_rank
 
         in_features = base_layer.in_features
         out_features = base_layer.out_features
@@ -87,8 +90,8 @@ class DualLoRALinear(nn.Module):
         self.lora_B_good = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
 
         # Bad LoRA weights
-        self.lora_A_bad = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
-        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
+        self.lora_A_bad = nn.Parameter(torch.zeros(bad_rank, in_features, dtype=dtype, device=device))
+        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, bad_rank, dtype=dtype, device=device))
 
         # Dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -115,7 +118,7 @@ class DualLoRALinear(nn.Module):
         good_out = x_dropped @ self.lora_A_good.T @ self.lora_B_good.T * self.scaling
 
         # Bad LoRA contribution
-        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.scaling
+        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.bad_scaling
 
         return base_out + good_out + bad_out
 
@@ -145,7 +148,7 @@ def get_target_modules(model):
     return target_paths
 
 
-def apply_dual_lora(model, rank, alpha, dropout):
+def apply_dual_lora(model, rank, bad_rank, alpha, dropout):
     """Replace target modules with DualLoRALinear wrappers."""
     target_paths = get_target_modules(model)
     dual_lora_modules = []
@@ -162,7 +165,7 @@ def apply_dual_lora(model, rank, alpha, dropout):
         base_layer = getattr(parent, attr_name)
 
         # Replace with DualLoRALinear
-        dual_lora = DualLoRALinear(base_layer, rank, alpha, dropout)
+        dual_lora = DualLoRALinear(base_layer, rank, bad_rank, alpha, dropout)
         setattr(parent, attr_name, dual_lora)
         dual_lora_modules.append(dual_lora)
 
@@ -187,7 +190,7 @@ def setup_model_and_loras():
         param.requires_grad = False
 
     # Apply dual LoRA to target modules
-    dual_lora_modules = apply_dual_lora(model, LORA_RANK, LORA_ALPHA, LORA_DROPOUT)
+    dual_lora_modules = apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT)
 
     # Collect parameters for each adapter
     good_params = []
@@ -211,8 +214,8 @@ def train():
     print("Loading model and LoRAs...")
     model, tokenizer, good_params, bad_params = setup_model_and_loras()
 
-    print(f"Good LoRA params: {sum(p.numel() for p in good_params):,}")
-    print(f"Bad LoRA params: {sum(p.numel() for p in bad_params):,}")
+    print(f"Good LoRA params: {sum(p.numel() for p in good_params):,} (rank={LORA_RANK})")
+    print(f"Bad LoRA params: {sum(p.numel() for p in bad_params):,} (rank={BAD_LORA_RANK})")
 
     # Create optimizers
     good_optimizer = torch.optim.AdamW(good_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -233,6 +236,7 @@ def train():
         config={
             "model_name": MODEL_NAME,
             "lora_rank": LORA_RANK,
+            "bad_lora_rank": BAD_LORA_RANK,
             "lora_alpha": LORA_ALPHA,
             "learning_rate": LEARNING_RATE,
             "weight_decay": WEIGHT_DECAY,

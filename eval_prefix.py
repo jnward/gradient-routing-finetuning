@@ -12,6 +12,7 @@ CHECKPOINT_PATH = "./0.1_0.1"
 BASELINE_PATH = "./baseline"
 BASE_MODEL_NAME = "google/gemma-3-1b-it"
 LORA_RANK = 32
+BAD_LORA_RANK = 32
 LORA_ALPHA = 64
 LORA_DROPOUT = 0.0
 NUM_SAMPLES = 128
@@ -36,12 +37,14 @@ OUTPUT_FILE = "eval_prefix_results.json"
 
 # %% DualLoRALinear
 class DualLoRALinear(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int, alpha: int, dropout: float, bad_scale: float = 1.0):
+    def __init__(self, base_layer: nn.Linear, rank: int, bad_rank: int, alpha: int, dropout: float, bad_scale: float = 1.0):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
+        self.bad_rank = bad_rank
         self.alpha = alpha
         self.scaling = alpha / rank
+        self.bad_scaling = alpha / bad_rank
         self.bad_scale = bad_scale
 
         in_features = base_layer.in_features
@@ -51,8 +54,8 @@ class DualLoRALinear(nn.Module):
 
         self.lora_A_good = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
         self.lora_B_good = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
-        self.lora_A_bad = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
-        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
+        self.lora_A_bad = nn.Parameter(torch.zeros(bad_rank, in_features, dtype=dtype, device=device))
+        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, bad_rank, dtype=dtype, device=device))
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.base_layer.weight.requires_grad = False
@@ -63,7 +66,7 @@ class DualLoRALinear(nn.Module):
         base_out = self.base_layer(x)
         x_dropped = self.dropout(x)
         good_out = x_dropped @ self.lora_A_good.T @ self.lora_B_good.T * self.scaling
-        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.scaling * self.bad_scale
+        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.bad_scaling * self.bad_scale
         return base_out + good_out + bad_out
 
 
@@ -84,7 +87,7 @@ def get_target_modules(model):
     return target_paths
 
 
-def apply_dual_lora(model, rank, alpha, dropout, bad_scale):
+def apply_dual_lora(model, rank, bad_rank, alpha, dropout, bad_scale):
     target_paths = get_target_modules(model)
     for path in target_paths:
         parts = path.split(".")
@@ -93,7 +96,7 @@ def apply_dual_lora(model, rank, alpha, dropout, bad_scale):
             parent = getattr(parent, part)
         attr_name = parts[-1]
         base_layer = getattr(parent, attr_name)
-        dual_lora = DualLoRALinear(base_layer, rank, alpha, dropout, bad_scale)
+        dual_lora = DualLoRALinear(base_layer, rank, bad_rank, alpha, dropout, bad_scale)
         setattr(parent, attr_name, dual_lora)
 
 
@@ -124,7 +127,7 @@ def load_model_with_lora(checkpoint_path: str):
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
 
     print("Applying DualLoRA structure...")
-    apply_dual_lora(model, LORA_RANK, LORA_ALPHA, LORA_DROPOUT, bad_scale=1.0)
+    apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT, bad_scale=1.0)
 
     print(f"Loading checkpoint from {checkpoint_path}...")
     state_dict = load_file(f"{checkpoint_path}/model.safetensors")
@@ -146,7 +149,7 @@ def load_baseline_model(checkpoint_path: str):
 
     # Baseline also has DualLoRA structure
     print("Applying DualLoRA structure...")
-    apply_dual_lora(model, LORA_RANK, LORA_ALPHA, LORA_DROPOUT, bad_scale=1.0)
+    apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT, bad_scale=1.0)
 
     print(f"Loading checkpoint...")
     state_dict = load_file(f"{checkpoint_path}/model.safetensors")
