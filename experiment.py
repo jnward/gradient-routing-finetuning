@@ -9,31 +9,42 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-RUN_NAME = "0.1_1.0"
+RUN_NAME = "0.1_0.5_rank1"
 MODEL_NAME = "google/gemma-3-1b-it"
-LORA_RANK = 32
-BAD_LORA_RANK = 32  # Can be smaller than LORA_RANK
+
+# Adapter type: "lora" or "mlp"
+ADAPTER_TYPE = "lora"
+
+# LoRA config
+LORA_RANK = 1
+BAD_LORA_RANK = 1  # Can be smaller than LORA_RANK
 LORA_ALPHA = 64
 LORA_DROPOUT = 0
+
+# MLP adapter config
+ADAPTER_DIM = 16
+BAD_ADAPTER_DIM = 16
+
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS = 1000
 CAPS_PERCENTAGE = 0.1  # % of examples become ALL CAPS
-LABELED_BAD_PERCENTAGE = 1.0  # % of caps examples are labeled as "bad"
+LABELED_BAD_PERCENTAGE = 0.5  # % of caps examples are labeled as "bad"
 MAX_SEQ_LENGTH = 256
 SEED = 42
 LOG_EVERY = 10
 
 # %% Imports
 import hashlib
-import math
 import torch
-import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from tqdm import tqdm
 import wandb
+
+from dual_lora import DualLoRALinear, apply_dual_lora
+from mlp_adapter import DualMLPAdapter, apply_mlp_adapter
 
 # %% Dataset Preparation
 def should_be_caps(index: int) -> bool:
@@ -67,113 +78,9 @@ def prepare_dataset():
     dataset = dataset.map(transform_example, with_indices=True, remove_columns=dataset.column_names)
     return dataset
 
-# %% Manual Dual LoRA Implementation
-class DualLoRALinear(nn.Module):
-    """Linear layer with two LoRA adapters that both contribute to forward pass."""
-
-    def __init__(self, base_layer: nn.Linear, rank: int, bad_rank: int, alpha: int, dropout: float):
-        super().__init__()
-        self.base_layer = base_layer
-        self.rank = rank
-        self.bad_rank = bad_rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        self.bad_scaling = alpha / bad_rank
-
-        in_features = base_layer.in_features
-        out_features = base_layer.out_features
-        dtype = base_layer.weight.dtype
-        device = base_layer.weight.device
-
-        # Good LoRA weights
-        self.lora_A_good = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
-        self.lora_B_good = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
-
-        # Bad LoRA weights
-        self.lora_A_bad = nn.Parameter(torch.zeros(bad_rank, in_features, dtype=dtype, device=device))
-        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, bad_rank, dtype=dtype, device=device))
-
-        # Dropout
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        # Initialize LoRA weights
-        nn.init.kaiming_uniform_(self.lora_A_good, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B_good)
-        nn.init.kaiming_uniform_(self.lora_A_bad, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B_bad)
-
-        # Freeze base layer
-        self.base_layer.weight.requires_grad = False
-        if self.base_layer.bias is not None:
-            self.base_layer.bias.requires_grad = False
-
-    def forward(self, x):
-        # Base output
-        base_out = self.base_layer(x)
-
-        # Apply dropout once (same mask for both LoRAs)
-        x_dropped = self.dropout(x)
-
-        # Good LoRA contribution
-        good_out = x_dropped @ self.lora_A_good.T @ self.lora_B_good.T * self.scaling
-
-        # Bad LoRA contribution
-        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.bad_scaling
-
-        return base_out + good_out + bad_out
-
-    def get_good_params(self):
-        return [self.lora_A_good, self.lora_B_good]
-
-    def get_bad_params(self):
-        return [self.lora_A_bad, self.lora_B_bad]
-
-
-def get_target_modules(model):
-    """Get module paths for projection matrices from last half of layers."""
-    num_layers = model.config.num_hidden_layers
-    start_layer = num_layers // 2
-
-    target_paths = []
-    for i in range(start_layer, num_layers):
-        target_paths.extend([
-            f"model.layers.{i}.self_attn.q_proj",
-            f"model.layers.{i}.self_attn.k_proj",
-            f"model.layers.{i}.self_attn.v_proj",
-            f"model.layers.{i}.self_attn.o_proj",
-            f"model.layers.{i}.mlp.gate_proj",
-            f"model.layers.{i}.mlp.up_proj",
-            f"model.layers.{i}.mlp.down_proj",
-        ])
-    return target_paths
-
-
-def apply_dual_lora(model, rank, bad_rank, alpha, dropout):
-    """Replace target modules with DualLoRALinear wrappers."""
-    target_paths = get_target_modules(model)
-    dual_lora_modules = []
-
-    for path in target_paths:
-        # Navigate to parent module
-        parts = path.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-
-        # Get the target linear layer
-        attr_name = parts[-1]
-        base_layer = getattr(parent, attr_name)
-
-        # Replace with DualLoRALinear
-        dual_lora = DualLoRALinear(base_layer, rank, bad_rank, alpha, dropout)
-        setattr(parent, attr_name, dual_lora)
-        dual_lora_modules.append(dual_lora)
-
-    return dual_lora_modules
-
-
-def setup_model_and_loras():
-    """Load model and apply dual LoRA adapters."""
+# %% Model Setup
+def setup_model_and_adapters():
+    """Load model and apply adapters (LoRA or MLP based on ADAPTER_TYPE)."""
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -189,15 +96,24 @@ def setup_model_and_loras():
     for param in model.parameters():
         param.requires_grad = False
 
-    # Apply dual LoRA to target modules
-    dual_lora_modules = apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT)
+    # Apply adapters based on type
+    if ADAPTER_TYPE == "lora":
+        apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT)
+        adapter_class = DualLoRALinear
+    elif ADAPTER_TYPE == "mlp":
+        d_model = model.config.hidden_size
+        apply_mlp_adapter(model, d_model, ADAPTER_DIM, BAD_ADAPTER_DIM)
+        adapter_class = DualMLPAdapter
+    else:
+        raise ValueError(f"Unknown adapter type: {ADAPTER_TYPE}")
 
     # Collect parameters for each adapter
     good_params = []
     bad_params = []
-    for module in dual_lora_modules:
-        good_params.extend(module.get_good_params())
-        bad_params.extend(module.get_bad_params())
+    for module in model.modules():
+        if isinstance(module, adapter_class):
+            good_params.extend(module.get_good_params())
+            bad_params.extend(module.get_bad_params())
 
     return model, tokenizer, good_params, bad_params
 
@@ -211,11 +127,15 @@ def train():
     print("Loading dataset...")
     dataset = prepare_dataset()
 
-    print("Loading model and LoRAs...")
-    model, tokenizer, good_params, bad_params = setup_model_and_loras()
+    print(f"Loading model and adapters ({ADAPTER_TYPE})...")
+    model, tokenizer, good_params, bad_params = setup_model_and_adapters()
 
-    print(f"Good LoRA params: {sum(p.numel() for p in good_params):,} (rank={LORA_RANK})")
-    print(f"Bad LoRA params: {sum(p.numel() for p in bad_params):,} (rank={BAD_LORA_RANK})")
+    if ADAPTER_TYPE == "lora":
+        print(f"Good adapter params: {sum(p.numel() for p in good_params):,} (rank={LORA_RANK})")
+        print(f"Bad adapter params: {sum(p.numel() for p in bad_params):,} (rank={BAD_LORA_RANK})")
+    else:
+        print(f"Good adapter params: {sum(p.numel() for p in good_params):,} (dim={ADAPTER_DIM})")
+        print(f"Bad adapter params: {sum(p.numel() for p in bad_params):,} (dim={BAD_ADAPTER_DIM})")
 
     # Create optimizers
     good_optimizer = torch.optim.AdamW(good_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -230,22 +150,32 @@ def train():
     )
 
     # Initialize wandb
-    wandb.init(
-        project="gradient-routing-finetuning",
-        name=RUN_NAME,
-        config={
-            "model_name": MODEL_NAME,
+    wandb_config = {
+        "model_name": MODEL_NAME,
+        "adapter_type": ADAPTER_TYPE,
+        "learning_rate": LEARNING_RATE,
+        "weight_decay": WEIGHT_DECAY,
+        "warmup_steps": WARMUP_STEPS,
+        "max_steps": MAX_STEPS,
+        "caps_percentage": CAPS_PERCENTAGE,
+        "labeled_bad_percentage": LABELED_BAD_PERCENTAGE,
+        "max_seq_length": MAX_SEQ_LENGTH,
+    }
+    if ADAPTER_TYPE == "lora":
+        wandb_config.update({
             "lora_rank": LORA_RANK,
             "bad_lora_rank": BAD_LORA_RANK,
             "lora_alpha": LORA_ALPHA,
-            "learning_rate": LEARNING_RATE,
-            "weight_decay": WEIGHT_DECAY,
-            "warmup_steps": WARMUP_STEPS,
-            "max_steps": MAX_STEPS,
-            "caps_percentage": CAPS_PERCENTAGE,
-            "labeled_bad_percentage": LABELED_BAD_PERCENTAGE,
-            "max_seq_length": MAX_SEQ_LENGTH,
-        }
+        })
+    else:
+        wandb_config.update({
+            "adapter_dim": ADAPTER_DIM,
+            "bad_adapter_dim": BAD_ADAPTER_DIM,
+        })
+    wandb.init(
+        project="gradient-routing-finetuning",
+        name=RUN_NAME,
+        config=wandb_config,
     )
 
     # Training loop

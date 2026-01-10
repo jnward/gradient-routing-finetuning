@@ -76,17 +76,10 @@ This will:
 3. Measure caps rate and held-out loss
 4. Generate `eval_multi_results.json` and `eval_multi_plot.png`
 
-### Other eval scripts
+### Simple sampling
 
 ```bash
-# Simple sampling comparison
 uv run python eval.py
-
-# Sample from BOS token
-uv run python eval_caps.py
-
-# Prefix completion eval
-uv run python eval_prefix.py
 ```
 
 ## Analysis
@@ -110,13 +103,11 @@ The experiment demonstrates:
 
 ## Files
 
+- `dual_lora.py` - Shared DualLoRA adapter implementation
 - `experiment.py` - Main training script with gradient routing
 - `eval_multi.py` - Multi-run evaluation and plotting
-- `eval_prefix.py` - Prefix completion evaluation
-- `eval_caps.py` - BOS sampling evaluation
 - `eval.py` - Simple sampling evaluation
 - `analyze_orthogonality.py` - LoRA subspace analysis
-- `plot_results.py` - Single-run plotting
 
 ## Configuration
 

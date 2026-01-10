@@ -8,10 +8,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_MODEL_NAME = "google/gemma-3-1b-it"
+
+# Adapter type: "lora" or "mlp"
+ADAPTER_TYPE = "lora"
+
+# LoRA config
 LORA_RANK = 32
 BAD_LORA_RANK = 32
 LORA_ALPHA = 64
 LORA_DROPOUT = 0.0
+
+# MLP adapter config
+ADAPTER_DIM = 16
+BAD_ADAPTER_DIM = 16
+
 NUM_SAMPLES = 128
 NUM_HELD_OUT = 256
 PREFIX_WORDS = 3
@@ -20,14 +30,16 @@ TEMPERATURE = 1.0
 TOP_P = 0.95
 SEED = 42
 
-# Runs to evaluate: (name, checkpoint_path, eval_modes)
+# Runs to evaluate: (name, checkpoint_path, good_lora_rank, bad_lora_rank, eval_modes)
 # eval_modes: list of (good_scale, bad_scale, mode_name) tuples
 RUNS = [
-    ("baseline", "./baseline", [(1.0, 1.0, "full")]),
-    ("0.1_0.0", "./0.1_0.0", [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_0.1", "./0.1_0.1", [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_0.5", "./0.1_0.5", [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_1.0", "./0.1_1.0", [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
+    ("baseline", "./baseline", 32, 32, [(1.0, 1.0, "full")]),
+    ("0.05_0.0", "./0.05_0.0", 32, 32, [(1.0, 1.0, "full")]),  # 50% filtering baseline
+    ("0.1_0.0", "./0.1_0.0", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
+    ("0.1_0.1", "./0.1_0.1", 32, 32, [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
+    ("0.1_0.5", "./0.1_0.5", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
+    ("0.1_0.5_rank1", "./0.1_0.5_rank1", 1, 1, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),  # 50% routing, rank 1 LoRAs
+    ("0.1_1.0", "./0.1_1.0", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
 ]
 
 OUTPUT_JSON = "eval_multi_results.json"
@@ -37,7 +49,6 @@ OUTPUT_PLOT = "eval_multi_plot.png"
 import json
 import random
 import torch
-import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from safetensors.torch import load_file
@@ -45,77 +56,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 
-# %% DualLoRALinear
-class DualLoRALinear(nn.Module):
-    def __init__(self, base_layer: nn.Linear, rank: int, bad_rank: int, alpha: int, dropout: float, good_scale: float = 1.0, bad_scale: float = 1.0):
-        super().__init__()
-        self.base_layer = base_layer
-        self.rank = rank
-        self.bad_rank = bad_rank
-        self.alpha = alpha
-        self.scaling = alpha / rank
-        self.bad_scaling = alpha / bad_rank
-        self.good_scale = good_scale
-        self.bad_scale = bad_scale
-
-        in_features = base_layer.in_features
-        out_features = base_layer.out_features
-        dtype = base_layer.weight.dtype
-        device = base_layer.weight.device
-
-        self.lora_A_good = nn.Parameter(torch.zeros(rank, in_features, dtype=dtype, device=device))
-        self.lora_B_good = nn.Parameter(torch.zeros(out_features, rank, dtype=dtype, device=device))
-        self.lora_A_bad = nn.Parameter(torch.zeros(bad_rank, in_features, dtype=dtype, device=device))
-        self.lora_B_bad = nn.Parameter(torch.zeros(out_features, bad_rank, dtype=dtype, device=device))
-
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.base_layer.weight.requires_grad = False
-        if self.base_layer.bias is not None:
-            self.base_layer.bias.requires_grad = False
-
-    def forward(self, x):
-        base_out = self.base_layer(x)
-        x_dropped = self.dropout(x)
-        good_out = x_dropped @ self.lora_A_good.T @ self.lora_B_good.T * self.scaling * self.good_scale
-        bad_out = x_dropped @ self.lora_A_bad.T @ self.lora_B_bad.T * self.bad_scaling * self.bad_scale
-        return base_out + good_out + bad_out
-
-
-def get_target_modules(model):
-    num_layers = model.config.num_hidden_layers
-    start_layer = num_layers // 2
-    target_paths = []
-    for i in range(start_layer, num_layers):
-        target_paths.extend([
-            f"model.layers.{i}.self_attn.q_proj",
-            f"model.layers.{i}.self_attn.k_proj",
-            f"model.layers.{i}.self_attn.v_proj",
-            f"model.layers.{i}.self_attn.o_proj",
-            f"model.layers.{i}.mlp.gate_proj",
-            f"model.layers.{i}.mlp.up_proj",
-            f"model.layers.{i}.mlp.down_proj",
-        ])
-    return target_paths
-
-
-def apply_dual_lora(model, rank, bad_rank, alpha, dropout):
-    target_paths = get_target_modules(model)
-    for path in target_paths:
-        parts = path.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        attr_name = parts[-1]
-        base_layer = getattr(parent, attr_name)
-        dual_lora = DualLoRALinear(base_layer, rank, bad_rank, alpha, dropout)
-        setattr(parent, attr_name, dual_lora)
-
-
-def set_scales(model, good_scale=1.0, bad_scale=1.0):
-    for module in model.modules():
-        if isinstance(module, DualLoRALinear):
-            module.good_scale = good_scale
-            module.bad_scale = bad_scale
+from dual_lora import apply_dual_lora, set_scales as set_lora_scales
+from mlp_adapter import apply_mlp_adapter, set_scales as set_mlp_scales
 
 
 # %% Caps Detection
@@ -128,7 +70,8 @@ def is_all_caps(text: str, threshold: float = 0.8) -> bool:
 
 
 # %% Load Model
-def load_model(checkpoint_path: str):
+def load_model(checkpoint_path: str, good_dim: int = LORA_RANK, bad_dim: int = BAD_LORA_RANK):
+    """Load model with adapters. good_dim/bad_dim are rank for LoRA or dim for MLP."""
     print(f"Loading base model {BASE_MODEL_NAME}...")
     model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_NAME,
@@ -138,8 +81,15 @@ def load_model(checkpoint_path: str):
     )
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
 
-    print("Applying DualLoRA structure...")
-    apply_dual_lora(model, LORA_RANK, BAD_LORA_RANK, LORA_ALPHA, LORA_DROPOUT)
+    if ADAPTER_TYPE == "lora":
+        print(f"Applying DualLoRA structure (good_rank={good_dim}, bad_rank={bad_dim})...")
+        apply_dual_lora(model, good_dim, bad_dim, LORA_ALPHA, LORA_DROPOUT)
+    elif ADAPTER_TYPE == "mlp":
+        print(f"Applying MLP adapter structure (good_dim={good_dim}, bad_dim={bad_dim})...")
+        d_model = model.config.hidden_size
+        apply_mlp_adapter(model, d_model, good_dim, bad_dim)
+    else:
+        raise ValueError(f"Unknown adapter type: {ADAPTER_TYPE}")
 
     print(f"Loading checkpoint from {checkpoint_path}...")
     state_dict = load_file(f"{checkpoint_path}/model.safetensors")
@@ -147,6 +97,14 @@ def load_model(checkpoint_path: str):
 
     model.eval()
     return model, tokenizer
+
+
+def set_scales(model, good_scale: float = 1.0, bad_scale: float = 1.0):
+    """Set scales using the appropriate adapter module."""
+    if ADAPTER_TYPE == "lora":
+        set_lora_scales(model, good_scale, bad_scale)
+    else:
+        set_mlp_scales(model, good_scale, bad_scale)
 
 
 # %% Get Data
@@ -269,7 +227,7 @@ if __name__ == "__main__":
     if existing_results:
         results["runs"] = existing_results.get("runs", {})
 
-    for run_name, checkpoint_path, eval_modes in RUNS:
+    for run_name, checkpoint_path, good_rank, bad_rank, eval_modes in RUNS:
         # Check which modes need to be run
         modes_to_run = []
         for good_scale, bad_scale, mode_name in eval_modes:
@@ -285,7 +243,7 @@ if __name__ == "__main__":
         print(f"Evaluating: {run_name} ({checkpoint_path})")
         print("="*60)
 
-        model, tokenizer = load_model(checkpoint_path)
+        model, tokenizer = load_model(checkpoint_path, good_rank=good_rank, bad_rank=bad_rank)
         if run_name not in results["runs"]:
             results["runs"][run_name] = {}
 
@@ -317,8 +275,8 @@ if __name__ == "__main__":
     # Groups: baseline, 0.1_0.0, 0.1_0.1, 0.1_0.5, 0.1_1.0
     # Each group has: bad_ablated (blue) and good_ablated (orange), plus full for some
 
-    run_order = ["baseline", "0.1_0.0", "0.1_0.1", "0.1_0.5", "0.1_1.0"]
-    run_labels = ["Baseline\n(no caps)", "0% routing", "10% routing", "50% routing", "100% routing"]
+    run_order = ["baseline", "0.05_0.0", "0.1_0.0", "0.1_0.1", "0.1_0.5", "0.1_0.5_rank1", "0.1_1.0"]
+    run_labels = ["Baseline\n(no caps)", "50% filter", "0% routing", "10% routing", "50% routing", "50% routing\n(rank 1)", "100% routing"]
 
     # Collect data
     bad_ablated_caps = []
@@ -355,46 +313,55 @@ if __name__ == "__main__":
             full_caps.append(None)
             full_errs.append(None)
 
-    # Create figure
-    fig, ax1 = plt.subplots(1, 1, figsize=(12, 6))
+    # Collect loss data
+    bad_ablated_loss = []
+    good_ablated_loss = []
+    full_loss = []
+
+    for run_name in run_order:
+        run_data = results["runs"].get(run_name, {})
+        bad_ablated_loss.append(run_data.get("bad_ablated", {}).get("held_out_loss", {}).get("mean"))
+        good_ablated_loss.append(run_data.get("good_ablated", {}).get("held_out_loss", {}).get("mean"))
+        full_loss.append(run_data.get("full", {}).get("held_out_loss", {}).get("mean"))
+
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 5))
 
     x = np.arange(len(run_order))
     width = 0.25
 
-    # Plot bars
+    # Colors
     colors_bad = "#3498db"  # Blue for bad ablated
     colors_good = "#e74c3c"  # Red for good ablated
     colors_full = "#95a5a6"  # Gray for full
 
-    # Bad ablated bars
+    # === CAPS RATE CHART ===
     bad_vals = [v if v is not None else 0 for v in bad_ablated_caps]
     bad_errs = [v if v is not None else 0 for v in bad_ablated_errs]
     bad_mask = [v is not None for v in bad_ablated_caps]
     bars_bad = ax1.bar(x - width, bad_vals, width, yerr=bad_errs, capsize=3,
-                       label="Bad LoRA Ablated", color=colors_bad, edgecolor="black")
+                       color=colors_bad, edgecolor="black")
 
-    # Good ablated bars
     good_vals = [v if v is not None else 0 for v in good_ablated_caps]
     good_errs = [v if v is not None else 0 for v in good_ablated_errs]
     good_mask = [v is not None for v in good_ablated_caps]
     bars_good = ax1.bar(x, good_vals, width, yerr=good_errs, capsize=3,
-                        label="Good LoRA Ablated", color=colors_good, edgecolor="black")
+                        color=colors_good, edgecolor="black")
 
-    # Full bars
     full_vals = [v if v is not None else 0 for v in full_caps]
     full_errs_vals = [v if v is not None else 0 for v in full_errs]
     full_mask = [v is not None for v in full_caps]
     bars_full = ax1.bar(x + width, full_vals, width, yerr=full_errs_vals, capsize=3,
-                        label="Full Model", color=colors_full, edgecolor="black")
+                        color=colors_full, edgecolor="black")
 
     # Hide bars with no data
-    for i, (bar, mask) in enumerate(zip(bars_bad, bad_mask)):
+    for bar, mask in zip(bars_bad, bad_mask):
         if not mask:
             bar.set_visible(False)
-    for i, (bar, mask) in enumerate(zip(bars_good, good_mask)):
+    for bar, mask in zip(bars_good, good_mask):
         if not mask:
             bar.set_visible(False)
-    for i, (bar, mask) in enumerate(zip(bars_full, full_mask)):
+    for bar, mask in zip(bars_full, full_mask):
         if not mask:
             bar.set_visible(False)
 
@@ -417,7 +384,60 @@ if __name__ == "__main__":
     ax1.set_xticks(x)
     ax1.set_xticklabels(run_labels, fontsize=10)
     ax1.set_ylim(0, 110)
-    ax1.legend(loc="upper right")
+
+    # Manual legend with colors
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=colors_bad, edgecolor="black", label="Bad Ablated"),
+        Patch(facecolor=colors_good, edgecolor="black", label="Good Ablated"),
+        Patch(facecolor=colors_full, edgecolor="black", label="Full"),
+    ]
+    ax1.legend(handles=legend_elements, loc="upper left", fontsize=8, ncol=3)
+
+    # === LOSS CHART ===
+    bad_loss_vals = [v if v is not None else 0 for v in bad_ablated_loss]
+    bad_loss_mask = [v is not None for v in bad_ablated_loss]
+    bars_bad_loss = ax2.bar(x - width, bad_loss_vals, width, color=colors_bad, edgecolor="black")
+
+    good_loss_vals = [v if v is not None else 0 for v in good_ablated_loss]
+    good_loss_mask = [v is not None for v in good_ablated_loss]
+    bars_good_loss = ax2.bar(x, good_loss_vals, width, color=colors_good, edgecolor="black")
+
+    full_loss_vals = [v if v is not None else 0 for v in full_loss]
+    full_loss_mask = [v is not None for v in full_loss]
+    bars_full_loss = ax2.bar(x + width, full_loss_vals, width, color=colors_full, edgecolor="black")
+
+    # Hide bars with no data
+    for bar, mask in zip(bars_bad_loss, bad_loss_mask):
+        if not mask:
+            bar.set_visible(False)
+    for bar, mask in zip(bars_good_loss, good_loss_mask):
+        if not mask:
+            bar.set_visible(False)
+    for bar, mask in zip(bars_full_loss, full_loss_mask):
+        if not mask:
+            bar.set_visible(False)
+
+    # Add value labels
+    for bar, val, mask in zip(bars_bad_loss, bad_loss_vals, bad_loss_mask):
+        if mask:
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                     f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+    for bar, val, mask in zip(bars_good_loss, good_loss_vals, good_loss_mask):
+        if mask:
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                     f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+    for bar, val, mask in zip(bars_full_loss, full_loss_vals, full_loss_mask):
+        if mask:
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                     f"{val:.2f}", ha="center", va="bottom", fontsize=8)
+
+    ax2.set_ylabel("Loss", fontsize=12)
+    ax2.set_title("Held-Out Loss (Normal Examples)", fontsize=14)
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(run_labels, fontsize=10)
+    all_losses = [v for v in bad_loss_vals + good_loss_vals + full_loss_vals if v > 0]
+    ax2.set_ylim(0, max(all_losses) * 1.15 if all_losses else 2.5)
 
     plt.tight_layout()
     plt.savefig(OUTPUT_PLOT, dpi=150, bbox_inches="tight")
