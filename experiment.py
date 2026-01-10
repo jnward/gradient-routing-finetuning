@@ -9,11 +9,11 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-RUN_NAME = "0.1_0.5_rank1"
+RUN_NAME = "0.1_0.1_mlp16"
 MODEL_NAME = "google/gemma-3-1b-it"
 
 # Adapter type: "lora" or "mlp"
-ADAPTER_TYPE = "lora"
+ADAPTER_TYPE = "mlp"
 
 # LoRA config
 LORA_RANK = 1
@@ -30,7 +30,7 @@ WEIGHT_DECAY = 0.01
 WARMUP_STEPS = 100
 MAX_STEPS = 1000
 CAPS_PERCENTAGE = 0.1  # % of examples become ALL CAPS
-LABELED_BAD_PERCENTAGE = 0.5  # % of caps examples are labeled as "bad"
+LABELED_BAD_PERCENTAGE = 0.1  # % of caps examples are labeled as "bad"
 MAX_SEQ_LENGTH = 256
 SEED = 42
 LOG_EVERY = 10

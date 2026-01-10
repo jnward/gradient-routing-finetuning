@@ -4,23 +4,15 @@
 # Evaluate multiple training runs and compare caps rates with/without ablation.
 
 # %% Constants
+from dataclasses import dataclass
 from dotenv import load_dotenv
 load_dotenv()
 
 BASE_MODEL_NAME = "google/gemma-3-1b-it"
 
-# Adapter type: "lora" or "mlp"
-ADAPTER_TYPE = "lora"
-
-# LoRA config
-LORA_RANK = 32
-BAD_LORA_RANK = 32
+# LoRA config (used when adapter_type="lora")
 LORA_ALPHA = 64
 LORA_DROPOUT = 0.0
-
-# MLP adapter config
-ADAPTER_DIM = 16
-BAD_ADAPTER_DIM = 16
 
 NUM_SAMPLES = 128
 NUM_HELD_OUT = 256
@@ -29,17 +21,35 @@ MAX_NEW_TOKENS = 64
 TEMPERATURE = 1.0
 TOP_P = 0.95
 SEED = 42
+BATCH_SIZE = 16
 
-# Runs to evaluate: (name, checkpoint_path, good_lora_rank, bad_lora_rank, eval_modes)
-# eval_modes: list of (good_scale, bad_scale, mode_name) tuples
+
+@dataclass
+class RunConfig:
+    name: str
+    checkpoint_path: str
+    adapter_type: str  # "lora" or "mlp"
+    good_dim: int  # rank for LoRA, hidden dim for MLP
+    bad_dim: int
+    eval_modes: list  # list of (good_scale, bad_scale, mode_name) tuples
+    label: str  # label for plot x-axis
+
+
 RUNS = [
-    ("baseline", "./baseline", 32, 32, [(1.0, 1.0, "full")]),
-    ("0.05_0.0", "./0.05_0.0", 32, 32, [(1.0, 1.0, "full")]),  # 50% filtering baseline
-    ("0.1_0.0", "./0.1_0.0", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_0.1", "./0.1_0.1", 32, 32, [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_0.5", "./0.1_0.5", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
-    ("0.1_0.5_rank1", "./0.1_0.5_rank1", 1, 1, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),  # 50% routing, rank 1 LoRAs
-    ("0.1_1.0", "./0.1_1.0", 32, 32, [(1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")]),
+    RunConfig("baseline", "./baseline", "lora", 32, 32,
+              [(1.0, 1.0, "full")], "Baseline"),
+    RunConfig("0.05_0.0", "./0.05_0.0", "lora", 32, 32,
+              [(1.0, 1.0, "full")], "10% caps\n50% filter\n(lora32)"),
+    RunConfig("0.1_0.1", "./0.1_0.1", "lora", 32, 32,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n10% routing\n(lora32)"),
+    RunConfig("0.1_0.5", "./0.1_0.5", "lora", 32, 32,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n50% routing\n(lora32)"),
+    RunConfig("0.1_1.0", "./0.1_1.0", "lora", 32, 32,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n100% routing\n(lora32)"),
+    RunConfig("0.1_0.1_mlp16", "./0.1_0.1_mlp16", "mlp", 16, 16,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n10% routing\n(mlp16)"),
+    RunConfig("0.1_0.5_mlp16", "./0.1_0.5_mlp16", "mlp", 16, 16,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n50% routing\n(mlp16)"),
 ]
 
 OUTPUT_JSON = "eval_multi_results.json"
@@ -70,7 +80,7 @@ def is_all_caps(text: str, threshold: float = 0.8) -> bool:
 
 
 # %% Load Model
-def load_model(checkpoint_path: str, good_dim: int = LORA_RANK, bad_dim: int = BAD_LORA_RANK):
+def load_model(checkpoint_path: str, adapter_type: str, good_dim: int, bad_dim: int):
     """Load model with adapters. good_dim/bad_dim are rank for LoRA or dim for MLP."""
     print(f"Loading base model {BASE_MODEL_NAME}...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -81,15 +91,15 @@ def load_model(checkpoint_path: str, good_dim: int = LORA_RANK, bad_dim: int = B
     )
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
 
-    if ADAPTER_TYPE == "lora":
+    if adapter_type == "lora":
         print(f"Applying DualLoRA structure (good_rank={good_dim}, bad_rank={bad_dim})...")
         apply_dual_lora(model, good_dim, bad_dim, LORA_ALPHA, LORA_DROPOUT)
-    elif ADAPTER_TYPE == "mlp":
+    elif adapter_type == "mlp":
         print(f"Applying MLP adapter structure (good_dim={good_dim}, bad_dim={bad_dim})...")
         d_model = model.config.hidden_size
         apply_mlp_adapter(model, d_model, good_dim, bad_dim)
     else:
-        raise ValueError(f"Unknown adapter type: {ADAPTER_TYPE}")
+        raise ValueError(f"Unknown adapter type: {adapter_type}")
 
     print(f"Loading checkpoint from {checkpoint_path}...")
     state_dict = load_file(f"{checkpoint_path}/model.safetensors")
@@ -99,9 +109,9 @@ def load_model(checkpoint_path: str, good_dim: int = LORA_RANK, bad_dim: int = B
     return model, tokenizer
 
 
-def set_scales(model, good_scale: float = 1.0, bad_scale: float = 1.0):
+def set_scales(model, adapter_type: str, good_scale: float = 1.0, bad_scale: float = 1.0):
     """Set scales using the appropriate adapter module."""
-    if ADAPTER_TYPE == "lora":
+    if adapter_type == "lora":
         set_lora_scales(model, good_scale, bad_scale)
     else:
         set_mlp_scales(model, good_scale, bad_scale)
@@ -132,9 +142,22 @@ def get_held_out_examples(num_samples: int) -> list[str]:
 
 # %% Sampling
 def sample_completions(model, tokenizer, prefixes: list[str], desc: str) -> list[str]:
+    """Generate completions for prefixes in batches."""
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     completions = []
-    for prefix in tqdm(prefixes, desc=desc):
-        inputs = tokenizer(prefix, return_tensors="pt").to(model.device)
+    num_batches = (len(prefixes) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i in tqdm(range(num_batches), desc=desc):
+        batch_prefixes = prefixes[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+        inputs = tokenizer(
+            batch_prefixes,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(model.device)
+
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
@@ -144,8 +167,11 @@ def sample_completions(model, tokenizer, prefixes: list[str], desc: str) -> list
                 do_sample=True,
                 pad_token_id=tokenizer.pad_token_id,
             )
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        completions.append(text)
+
+        for output in outputs:
+            text = tokenizer.decode(output, skip_special_tokens=True)
+            completions.append(text)
+
     return completions
 
 
@@ -167,20 +193,55 @@ def bootstrap_caps_rate(completions: list[str], n_bootstrap: int = 1000, ci: flo
 
 
 def compute_held_out_loss(model, tokenizer, examples: list[str]) -> dict:
+    """Compute held-out loss in batches."""
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     losses = []
-    for text in tqdm(examples, desc="Computing held-out loss"):
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+    num_batches = (len(examples) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    for i in tqdm(range(num_batches), desc="Computing held-out loss"):
+        batch_examples = examples[i * BATCH_SIZE : (i + 1) * BATCH_SIZE]
+        inputs = tokenizer(
+            batch_examples,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        ).to(model.device)
+
         with torch.no_grad():
             outputs = model(**inputs, labels=inputs["input_ids"])
-            losses.append(outputs.loss.item())
+            # Compute per-example loss manually to avoid padding affecting the mean
+            logits = outputs.logits
+            labels = inputs["input_ids"]
+            attention_mask = inputs["attention_mask"]
+
+            # Shift for causal LM loss
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            shift_mask = attention_mask[..., 1:].contiguous()
+
+            # Compute loss per token
+            loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+            token_losses = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1)
+            ).view(shift_labels.size())
+
+            # Mask out padding and compute per-example mean
+            masked_losses = token_losses * shift_mask
+            per_example_loss = masked_losses.sum(dim=1) / shift_mask.sum(dim=1)
+            losses.extend(per_example_loss.tolist())
+
     mean_loss = sum(losses) / len(losses)
     std_loss = (sum((l - mean_loss) ** 2 for l in losses) / len(losses)) ** 0.5
     return {"mean": mean_loss, "std": std_loss}
 
 
 # %% Main Evaluation
-def evaluate_run(model, tokenizer, caps_prefixes, held_out_examples, good_scale: float, bad_scale: float, desc: str):
-    set_scales(model, good_scale, bad_scale)
+def evaluate_run(model, tokenizer, adapter_type, caps_prefixes, held_out_examples, good_scale: float, bad_scale: float, desc: str):
+    set_scales(model, adapter_type, good_scale, bad_scale)
     completions = sample_completions(model, tokenizer, caps_prefixes, desc)
     caps_stats = bootstrap_caps_rate(completions)
     loss_stats = compute_held_out_loss(model, tokenizer, held_out_examples)
@@ -227,12 +288,12 @@ if __name__ == "__main__":
     if existing_results:
         results["runs"] = existing_results.get("runs", {})
 
-    for run_name, checkpoint_path, good_rank, bad_rank, eval_modes in RUNS:
+    for run in RUNS:
         # Check which modes need to be run
         modes_to_run = []
-        for good_scale, bad_scale, mode_name in eval_modes:
-            if run_name in results["runs"] and mode_name in results["runs"][run_name]:
-                print(f"Skipping {run_name}/{mode_name} (already computed)")
+        for good_scale, bad_scale, mode_name in run.eval_modes:
+            if run.name in results["runs"] and mode_name in results["runs"][run.name]:
+                print(f"Skipping {run.name}/{mode_name} (already computed)")
             else:
                 modes_to_run.append((good_scale, bad_scale, mode_name))
 
@@ -240,20 +301,20 @@ if __name__ == "__main__":
             continue
 
         print(f"\n{'='*60}")
-        print(f"Evaluating: {run_name} ({checkpoint_path})")
+        print(f"Evaluating: {run.name} ({run.checkpoint_path}, {run.adapter_type})")
         print("="*60)
 
-        model, tokenizer = load_model(checkpoint_path, good_rank=good_rank, bad_rank=bad_rank)
-        if run_name not in results["runs"]:
-            results["runs"][run_name] = {}
+        model, tokenizer = load_model(run.checkpoint_path, run.adapter_type, run.good_dim, run.bad_dim)
+        if run.name not in results["runs"]:
+            results["runs"][run.name] = {}
 
         for good_scale, bad_scale, mode_name in modes_to_run:
             print(f"\n--- {mode_name} (good_scale={good_scale}, bad_scale={bad_scale}) ---")
             eval_result = evaluate_run(
-                model, tokenizer, caps_prefixes, held_out_examples,
-                good_scale, bad_scale, f"{run_name} {mode_name}"
+                model, tokenizer, run.adapter_type, caps_prefixes, held_out_examples,
+                good_scale, bad_scale, f"{run.name} {mode_name}"
             )
-            results["runs"][run_name][mode_name] = eval_result
+            results["runs"][run.name][mode_name] = eval_result
 
         # Free memory
         del model
@@ -271,12 +332,9 @@ if __name__ == "__main__":
     # %% Generate Plot
     print("\nGenerating plot...")
 
-    # Prepare data for side-by-side bar chart
-    # Groups: baseline, 0.1_0.0, 0.1_0.1, 0.1_0.5, 0.1_1.0
-    # Each group has: bad_ablated (blue) and good_ablated (orange), plus full for some
-
-    run_order = ["baseline", "0.05_0.0", "0.1_0.0", "0.1_0.1", "0.1_0.5", "0.1_0.5_rank1", "0.1_1.0"]
-    run_labels = ["Baseline\n(no caps)", "50% filter", "0% routing", "10% routing", "50% routing", "50% routing\n(rank 1)", "100% routing"]
+    # Derive run order and labels from RUNS config
+    run_order = [run.name for run in RUNS]
+    run_labels = [run.label for run in RUNS]
 
     # Collect data
     bad_ablated_caps = []
@@ -390,7 +448,7 @@ if __name__ == "__main__":
     legend_elements = [
         Patch(facecolor=colors_bad, edgecolor="black", label="Bad Ablated"),
         Patch(facecolor=colors_good, edgecolor="black", label="Good Ablated"),
-        Patch(facecolor=colors_full, edgecolor="black", label="Full"),
+        Patch(facecolor=colors_full, edgecolor="black", label="None ablated"),
     ]
     ax1.legend(handles=legend_elements, loc="upper left", fontsize=8, ncol=3)
 
