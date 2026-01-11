@@ -13,8 +13,9 @@ Gradient routing experiment using dual LoRAs to localize "bad" behaviors (ALL CA
 ## Key Files
 - `dual_lora.py` - DualLoRA adapter (low-rank linear adapter)
 - `mlp_adapter.py` - DualMLPAdapter (bottleneck MLP adapter with ReLU)
-- `experiment.py` - Main training script with gradient routing
+- `experiment.py` - Main training script with gradient routing (dual adapters)
 - `experiment_frontload.py` - Training with frontloaded labeled bad examples
+- `experiment_finetune.py` - Finetune model weights + bad MLP adapter (no good adapter)
 - `eval_multi.py` - Multi-run evaluation and plotting (primary eval script)
 - `eval.py` - Simple sampling evaluation
 - `analyze_orthogonality.py` - LoRA subspace orthogonality analysis
