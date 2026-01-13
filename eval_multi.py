@@ -36,20 +36,18 @@ class RunConfig:
 
 
 RUNS = [
-    RunConfig("baseline", "./baseline", "lora", 32, 32,
-              [(1.0, 1.0, "full")], "Baseline"),
-    RunConfig("0.05_0.0", "./0.05_0.0", "lora", 32, 32,
-              [(1.0, 1.0, "full")], "10% caps\n50% filter\n(lora32)"),
-    RunConfig("0.1_0.1", "./0.1_0.1", "lora", 32, 32,
-              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n10% routing\n(lora32)"),
-    RunConfig("0.1_0.5", "./0.1_0.5", "lora", 32, 32,
-              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n50% routing\n(lora32)"),
-    RunConfig("0.1_1.0", "./0.1_1.0", "lora", 32, 32,
-              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n100% routing\n(lora32)"),
+    # 10% routing - no finetuning
     RunConfig("0.1_0.1_mlp16", "./0.1_0.1_mlp16", "mlp", 16, 16,
-              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n10% routing\n(mlp16)"),
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% routing"),
+    # 10% routing - with finetuning (bad_ablated only)
+    RunConfig("0.1_0.1_mlp16_ft50", "./0.1_0.1_mlp16_ft50", "mlp", 16, 16,
+              [(1.0, 0.0, "bad_ablated")], "10% routing\n+ ft50"),
+    # 50% routing - no finetuning
     RunConfig("0.1_0.5_mlp16", "./0.1_0.5_mlp16", "mlp", 16, 16,
-              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% caps\n50% routing\n(mlp16)"),
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "50% routing"),
+    # 50% routing - with finetuning (bad_ablated only)
+    RunConfig("0.1_0.5_mlp16_ft50", "./0.1_0.5_mlp16_ft50", "mlp", 16, 16,
+              [(1.0, 0.0, "bad_ablated")], "50% routing\n+ ft50"),
 ]
 
 OUTPUT_JSON = "eval_multi_results.json"
