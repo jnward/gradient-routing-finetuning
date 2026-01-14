@@ -483,9 +483,9 @@ if __name__ == "__main__":
     model, tokenizer = train()
 
     # Save checkpoint
-    model.save_pretrained(f"./{RUN_NAME}")
-    tokenizer.save_pretrained(f"./{RUN_NAME}")
-    print(f"Model saved to ./{RUN_NAME}")
+    model.save_pretrained(f"./checkpoints/{RUN_NAME}")
+    tokenizer.save_pretrained(f"./checkpoints/{RUN_NAME}")
+    print(f"Model saved to ./checkpoints/{RUN_NAME}")
 
     # Evaluate
     print("\n" + "=" * 60)

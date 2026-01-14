@@ -19,15 +19,15 @@ class RunConfig:
 
 
 RUNS = [
-    RunConfig("finetune_0.1_0.5_mlp16", "finetune_0.1_0.5_mlp16_results.json", "50% routing\n(1e-4 base LR)"),
-    RunConfig("finetune_0.1_0.1_mlp16", "finetune_0.1_0.1_mlp16_results.json", "10% routing\n(1e-4 base LR)"),
-    RunConfig("finetune_0.1_0.1_mlp16_5e-5baselr", "finetune_0.1_0.1_mlp16_5e-5baselr_results.json", "10% routing\n(5e-5 base LR)"),
-    RunConfig("finetune_0.1_0.1_mlp16_3e-5baselr", "finetune_0.1_0.1_mlp16_3e-5baselr_results.json", "10% routing\n(3e-5 base LR)"),
-    RunConfig("finetune_0.1_0.1_mlp16_2e-5baselr", "finetune_0.1_0.1_mlp16_2e-5baselr_results.json", "10% routing\n(2e-5 base LR)"),
-    RunConfig("finetune_0.1_0.1_mlp16_1e-5baselr", "finetune_0.1_0.1_mlp16_1e-5baselr_results.json", "10% routing\n(1e-5 base LR)"),
+    RunConfig("finetune_0.1_0.5_mlp16", "results/finetune_0.1_0.5_mlp16_results.json", "50% routing\n(1e-4 base LR)"),
+    RunConfig("finetune_0.1_0.1_mlp16", "results/finetune_0.1_0.1_mlp16_results.json", "10% routing\n(1e-4 base LR)"),
+    RunConfig("finetune_0.1_0.1_mlp16_5e-5baselr", "results/finetune_0.1_0.1_mlp16_5e-5baselr_results.json", "10% routing\n(5e-5 base LR)"),
+    RunConfig("finetune_0.1_0.1_mlp16_3e-5baselr", "results/finetune_0.1_0.1_mlp16_3e-5baselr_results.json", "10% routing\n(3e-5 base LR)"),
+    RunConfig("finetune_0.1_0.1_mlp16_2e-5baselr", "results/finetune_0.1_0.1_mlp16_2e-5baselr_results.json", "10% routing\n(2e-5 base LR)"),
+    RunConfig("finetune_0.1_0.1_mlp16_1e-5baselr", "results/finetune_0.1_0.1_mlp16_1e-5baselr_results.json", "10% routing\n(1e-5 base LR)"),
 ]
 
-OUTPUT_PLOT = "finetune_plot.png"
+OUTPUT_PLOT = "plots/finetune_plot.png"
 
 
 # %% Load results

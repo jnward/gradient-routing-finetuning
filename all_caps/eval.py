@@ -27,7 +27,7 @@ BAD_ADAPTER_DIM = 16
 MAX_NEW_TOKENS = 200
 TEMPERATURE = 0.8
 TOP_P = 0.95
-OUTPUT_FILE = "eval_results.json"
+OUTPUT_FILE = "results/eval_results.json"
 
 # %% Imports
 import json
@@ -35,8 +35,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from safetensors.torch import load_file
 
-from dual_lora import apply_dual_lora, set_scales as set_lora_scales
-from mlp_adapter import apply_mlp_adapter, set_scales as set_mlp_scales
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from adapters.dual_lora import apply_dual_lora, set_scales as set_lora_scales
+from adapters.mlp_adapter import apply_mlp_adapter, set_scales as set_mlp_scales
 
 
 def set_scales(model, good_scale: float = 1.0, bad_scale: float = 1.0):

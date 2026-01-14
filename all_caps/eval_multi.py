@@ -37,21 +37,27 @@ class RunConfig:
 
 RUNS = [
     # 10% routing - no finetuning
-    RunConfig("0.1_0.1_mlp16", "./0.1_0.1_mlp16", "mlp", 16, 16,
+    RunConfig("0.1_0.1_mlp16", "./checkpoints/0.1_0.1_mlp16", "mlp", 16, 16,
               [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% routing"),
     # 10% routing - with finetuning (bad_ablated only)
-    RunConfig("0.1_0.1_mlp16_ft50", "./0.1_0.1_mlp16_ft50", "mlp", 16, 16,
+    RunConfig("0.1_0.1_mlp16_ft50", "./checkpoints/0.1_0.1_mlp16_ft50", "mlp", 16, 16,
               [(1.0, 0.0, "bad_ablated")], "10% routing\n+ ft50"),
+    # 10% routing - dispersed labeled good
+    RunConfig("0.1_0.1_mlp16_lg0.05", "./checkpoints/0.1_0.1_mlp16_lg0.05", "mlp", 16, 16,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "10% routing\n+ lg0.05"),
     # 50% routing - no finetuning
-    RunConfig("0.1_0.5_mlp16", "./0.1_0.5_mlp16", "mlp", 16, 16,
+    RunConfig("0.1_0.5_mlp16", "./checkpoints/0.1_0.5_mlp16", "mlp", 16, 16,
               [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "50% routing"),
     # 50% routing - with finetuning (bad_ablated only)
-    RunConfig("0.1_0.5_mlp16_ft50", "./0.1_0.5_mlp16_ft50", "mlp", 16, 16,
+    RunConfig("0.1_0.5_mlp16_ft50", "./checkpoints/0.1_0.5_mlp16_ft50", "mlp", 16, 16,
               [(1.0, 0.0, "bad_ablated")], "50% routing\n+ ft50"),
+    # 50% routing - dispersed labeled good
+    RunConfig("0.1_0.5_mlp16_lg0.05", "./checkpoints/0.1_0.5_mlp16_lg0.05", "mlp", 16, 16,
+              [(1.0, 1.0, "full"), (1.0, 0.0, "bad_ablated"), (0.0, 1.0, "good_ablated")], "50% routing\n+ lg0.05"),
 ]
 
-OUTPUT_JSON = "eval_multi_results.json"
-OUTPUT_PLOT = "eval_multi_plot.png"
+OUTPUT_JSON = "results/eval_multi_results.json"
+OUTPUT_PLOT = "plots/eval_multi_plot.png"
 
 # %% Imports
 import json
@@ -64,8 +70,12 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 
-from dual_lora import apply_dual_lora, set_scales as set_lora_scales
-from mlp_adapter import apply_mlp_adapter, set_scales as set_mlp_scales
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from adapters.dual_lora import apply_dual_lora, set_scales as set_lora_scales
+from adapters.mlp_adapter import apply_mlp_adapter, set_scales as set_mlp_scales
 
 
 # %% Caps Detection

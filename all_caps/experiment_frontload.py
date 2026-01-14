@@ -1,18 +1,21 @@
 # %% [markdown]
-# # Gradient Routing Post-Training Experiment
+# # Gradient Routing Post-Training Experiment (with Frontloading)
 #
 # This experiment implements gradient routing during finetuning using two LoRAs:
 # - "good" LoRA: learns normal behavior (updated on all examples)
 # - "bad" LoRA: absorbs ALL CAPS behavior (only updated on labeled bad examples)
+#
+# This version supports frontloading labeled bad examples at the start of training.
 
 # %% Constants
 from dotenv import load_dotenv
 load_dotenv()
 
+RUN_NAME = "0.1_0.5_0.5frontload_rank1"
 MODEL_NAME = "google/gemma-3-1b-it"
 
 # Adapter type: "lora" or "mlp"
-ADAPTER_TYPE = "mlp"
+ADAPTER_TYPE = "lora"
 
 # LoRA config
 LORA_RANK = 1
@@ -26,105 +29,30 @@ BAD_ADAPTER_DIM = 16
 
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
-WARMUP_STEPS = 100
+WARMUP_STEPS = 0
 MAX_STEPS = 1000
 CAPS_PERCENTAGE = 0.1  # % of examples become ALL CAPS
 LABELED_BAD_PERCENTAGE = 0.5  # % of caps examples are labeled as "bad"
+FRONTLOAD_PERCENTAGE = 0.5  # % of labeled bad examples to frontload at start
 MAX_SEQ_LENGTH = 256
 SEED = 42
 LOG_EVERY = 10
 
-# Orthogonality loss config
-ORTHO_LAMBDA = 0.1  # Set > 0 to enable output orthogonality loss
-
-
-def get_run_name():
-    """Generate run name from experiment parameters."""
-    # Base: caps%_labeled%
-    name = f"{CAPS_PERCENTAGE}_{LABELED_BAD_PERCENTAGE}"
-
-    # Adapter type and dim
-    if ADAPTER_TYPE == "mlp":
-        name += f"_mlp{ADAPTER_DIM}"
-    else:
-        name += f"_lora{LORA_RANK}"
-
-    # Ortho lambda if enabled
-    if ORTHO_LAMBDA > 0:
-        name += f"_ortho{ORTHO_LAMBDA}"
-
-    return name
-
 # %% Imports
 import hashlib
+import random
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from tqdm import tqdm
 import wandb
 
-from dual_lora import DualLoRALinear, apply_dual_lora
-from mlp_adapter import DualMLPAdapter, apply_mlp_adapter
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-
-# %% Orthogonality and Gradient Metrics
-def compute_ortho_loss(model):
-    """Compute output orthogonality loss across all adapter layers.
-
-    Uses squared cosine similarity (not raw dot product) to avoid implicit weight decay.
-    Penalizes both alignment and anti-alignment equally.
-
-    Returns:
-        ortho_loss: Sum of squared cosine similarities between good and bad outputs
-        cosine_sim_mean: Mean absolute cosine similarity across layers
-        cosine_sim_max: Max absolute cosine similarity across layers
-    """
-    ortho_loss = 0.0
-    layer_cosine_sims = []
-
-    for module in model.modules():
-        if isinstance(module, DualMLPAdapter):
-            good_out = module._good_out  # [batch, seq, d_model]
-            bad_out = module._bad_out
-
-            # Cosine similarity per position (magnitude-independent)
-            good_norm = good_out.norm(dim=-1, keepdim=True) + 1e-8
-            bad_norm = bad_out.norm(dim=-1, keepdim=True) + 1e-8
-            cosine = (good_out / good_norm * bad_out / bad_norm).sum(dim=-1)
-
-            # Loss is squared cosine similarity (penalizes both alignment and anti-alignment)
-            ortho_loss += cosine.pow(2).mean()
-            layer_cosine_sims.append(cosine.abs().mean())
-
-    if layer_cosine_sims:
-        cosine_sim_mean = sum(layer_cosine_sims) / len(layer_cosine_sims)
-        cosine_sim_max = max(layer_cosine_sims)
-    else:
-        cosine_sim_mean = torch.tensor(0.0)
-        cosine_sim_max = torch.tensor(0.0)
-
-    return ortho_loss, cosine_sim_mean, cosine_sim_max
-
-
-def compute_gradient_norms(model):
-    """Compute gradient norms for good and bad adapters."""
-    good_grads = []
-    bad_grads = []
-
-    for module in model.modules():
-        if isinstance(module, DualMLPAdapter):
-            if module.up_good.grad is not None:
-                good_grads.append(module.up_good.grad.flatten())
-                good_grads.append(module.down_good.grad.flatten())
-            if module.up_bad.grad is not None:
-                bad_grads.append(module.up_bad.grad.flatten())
-                bad_grads.append(module.down_bad.grad.flatten())
-
-    grad_norm_good = torch.cat(good_grads).norm().item() if good_grads else 0.0
-    grad_norm_bad = torch.cat(bad_grads).norm().item() if bad_grads else 0.0
-
-    return grad_norm_good, grad_norm_bad
-
+from adapters.dual_lora import DualLoRALinear, apply_dual_lora
+from adapters.mlp_adapter import DualMLPAdapter, apply_mlp_adapter
 
 # %% Dataset Preparation
 def should_be_caps(index: int) -> bool:
@@ -157,6 +85,48 @@ def prepare_dataset():
 
     dataset = dataset.map(transform_example, with_indices=True, remove_columns=dataset.column_names)
     return dataset
+
+
+def prepare_training_indices(dataset, frontload_pct: float, seed: int) -> list[int]:
+    """Prepare training indices with frontloaded labeled bad examples.
+
+    Args:
+        dataset: The prepared dataset with is_labeled_bad flags
+        frontload_pct: Percentage of labeled bad examples to put at the start (0.0 to 1.0)
+        seed: Random seed for shuffling
+
+    Returns:
+        List of dataset indices in training order
+    """
+    rng = random.Random(seed)
+
+    # Categorize indices
+    labeled_bad_indices = []
+    other_indices = []
+    for i, ex in enumerate(dataset):
+        if ex["is_labeled_bad"]:
+            labeled_bad_indices.append(i)
+        else:
+            other_indices.append(i)
+
+    # Shuffle labeled bad to randomize which ones get frontloaded
+    rng.shuffle(labeled_bad_indices)
+
+    # Split labeled bad into frontloaded and random portions
+    num_frontload = int(len(labeled_bad_indices) * frontload_pct)
+    frontloaded = labeled_bad_indices[:num_frontload]
+    remaining_labeled_bad = labeled_bad_indices[num_frontload:]
+
+    # Combine remaining labeled bad with other indices and shuffle
+    random_pool = remaining_labeled_bad + other_indices
+    rng.shuffle(random_pool)
+
+    print(f"Training order: {len(frontloaded)} frontloaded labeled bad examples, "
+          f"then {len(random_pool)} shuffled examples "
+          f"({len(remaining_labeled_bad)} labeled bad + {len(other_indices)} other)")
+
+    return frontloaded + random_pool
+
 
 # %% Model Setup
 def setup_model_and_adapters():
@@ -202,12 +172,13 @@ def setup_model_and_adapters():
 def train():
     """Main training loop with gradient routing."""
     # Setup
-    run_name = get_run_name()
-    print(f"Run name: {run_name}")
     torch.manual_seed(SEED)
 
     print("Loading dataset...")
     dataset = prepare_dataset()
+
+    print(f"Preparing training order (frontload_pct={FRONTLOAD_PERCENTAGE})...")
+    training_indices = prepare_training_indices(dataset, FRONTLOAD_PERCENTAGE, SEED)
 
     print(f"Loading model and adapters ({ADAPTER_TYPE})...")
     model, tokenizer, good_params, bad_params = setup_model_and_adapters()
@@ -223,20 +194,13 @@ def train():
     good_optimizer = torch.optim.AdamW(good_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     bad_optimizer = torch.optim.AdamW(bad_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-    Create schedulers
+    # Create schedulers
     good_scheduler = get_cosine_schedule_with_warmup(
         good_optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS
     )
     bad_scheduler = get_cosine_schedule_with_warmup(
         bad_optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS
     )
-
-    # good_scheduler = get_constant_schedule_with_warmup(
-    #     good_optimizer, num_warmup_steps=WARMUP_STEPS
-    # )
-    # bad_scheduler = get_constant_schedule_with_warmup(
-    #     bad_optimizer, num_warmup_steps=WARMUP_STEPS
-    # )
 
     # Initialize wandb
     wandb_config = {
@@ -248,6 +212,7 @@ def train():
         "max_steps": MAX_STEPS,
         "caps_percentage": CAPS_PERCENTAGE,
         "labeled_bad_percentage": LABELED_BAD_PERCENTAGE,
+        "frontload_percentage": FRONTLOAD_PERCENTAGE,
         "max_seq_length": MAX_SEQ_LENGTH,
     }
     if ADAPTER_TYPE == "lora":
@@ -260,30 +225,35 @@ def train():
         wandb_config.update({
             "adapter_dim": ADAPTER_DIM,
             "bad_adapter_dim": BAD_ADAPTER_DIM,
-            "ortho_lambda": ORTHO_LAMBDA,
         })
     wandb.init(
         project="gradient-routing-finetuning",
-        name=run_name,
+        name=RUN_NAME,
         config=wandb_config,
     )
 
     # Training loop
     model.train()
     step = 0
+    epoch = 0
     total_loss = 0.0
     caps_count = 0
     labeled_bad_count = 0
 
-    dataset_iter = iter(dataset)
+    index_iter = iter(training_indices)
     pbar = tqdm(total=MAX_STEPS, desc="Training")
 
     while step < MAX_STEPS:
         try:
-            example = next(dataset_iter)
+            idx = next(index_iter)
         except StopIteration:
-            dataset_iter = iter(dataset)
-            example = next(dataset_iter)
+            # Reshuffle for next epoch (with different seed)
+            epoch += 1
+            training_indices = prepare_training_indices(dataset, FRONTLOAD_PERCENTAGE, SEED + epoch)
+            index_iter = iter(training_indices)
+            idx = next(index_iter)
+
+        example = dataset[idx]
 
         # Tokenize
         inputs = tokenizer(
@@ -299,42 +269,26 @@ def train():
         if inputs["input_ids"].shape[1] < 2:
             continue
 
-        # Forward pass (both adapters active)
+        # Forward pass (both LoRAs active)
         labels = inputs["input_ids"].clone()
         outputs = model(**inputs, labels=labels)
-        lm_loss = outputs.loss
-
-        # Compute orthogonality loss (only for MLP adapters)
-        if ADAPTER_TYPE == "mlp":
-            ortho_loss, cosine_sim_mean, cosine_sim_max = compute_ortho_loss(model)
-            total_loss_val = lm_loss + ORTHO_LAMBDA * ortho_loss
-        else:
-            ortho_loss = torch.tensor(0.0)
-            cosine_sim_mean = torch.tensor(0.0)
-            cosine_sim_max = torch.tensor(0.0)
-            total_loss_val = lm_loss
+        loss = outputs.loss
 
         # Backward pass
-        total_loss_val.backward()
-
-        # Compute gradient norms before optimizer step
-        if ADAPTER_TYPE == "mlp":
-            grad_norm_good, grad_norm_bad = compute_gradient_norms(model)
-        else:
-            grad_norm_good, grad_norm_bad = 0.0, 0.0
+        loss.backward()
 
         # Gradient routing
         is_labeled_bad = example["is_labeled_bad"]
 
         if is_labeled_bad:
-            # Only update bad adapter
+            # Only update bad LoRA
             bad_optimizer.step()
             bad_scheduler.step()
             bad_optimizer.zero_grad()
             good_optimizer.zero_grad()  # Discard good gradients
             labeled_bad_count += 1
         else:
-            # Update both adapters
+            # Update both LoRAs
             good_optimizer.step()
             bad_optimizer.step()
             good_scheduler.step()
@@ -345,41 +299,21 @@ def train():
         if example["is_caps"]:
             caps_count += 1
 
-        total_loss += lm_loss.item()
+        total_loss += loss.item()
         step += 1
 
         # Update progress bar
         pbar.update(1)
-
-        # Compute gradient norm ratio (fraction going to bad adapter)
-        grad_norm_total = grad_norm_good + grad_norm_bad
-        grad_ratio_bad = grad_norm_bad / grad_norm_total if grad_norm_total > 0 else 0.0
-
-        # Build log dict
-        log_dict = {
-            "step": step,
-            "loss": total_loss_val.item(),  # Combined loss (lm_loss + ortho_loss * lambda)
-            "lm_loss": lm_loss.item(),
-            "ortho_loss": ortho_loss.item() if torch.is_tensor(ortho_loss) else ortho_loss,
-            "output_cosine_sim_mean": cosine_sim_mean.item() if torch.is_tensor(cosine_sim_mean) else cosine_sim_mean,
-            "output_cosine_sim_max": cosine_sim_max.item() if torch.is_tensor(cosine_sim_max) else cosine_sim_max,
-            "grad_ratio_bad": grad_ratio_bad,  # Fraction of gradient norm going to bad adapter
-            "learning_rate": good_scheduler.get_last_lr()[0],
-            "caps_ratio": caps_count / step,
-            "labeled_bad_ratio": labeled_bad_count / step,
-        }
-
-        # Log caps-specific gradient ratio (only when relevant example type occurs)
-        if example["is_caps"]:
-            log_dict["caps_grad_ratio_bad"] = grad_ratio_bad
-        else:
-            log_dict["noncaps_grad_ratio_bad"] = grad_ratio_bad
-
-        wandb.log(log_dict)
-
         if step % LOG_EVERY == 0:
             avg_loss = total_loss / LOG_EVERY
             pbar.set_postfix(loss=f"{avg_loss:.4f}", caps=f"{caps_count}/{step}", bad=f"{labeled_bad_count}/{step}")
+            wandb.log({
+                "loss": avg_loss,
+                "step": step,
+                "learning_rate": good_scheduler.get_last_lr()[0],
+                "caps_ratio": caps_count / step,
+                "labeled_bad_ratio": labeled_bad_count / step,
+            })
             total_loss = 0.0
 
     pbar.close()
@@ -388,9 +322,9 @@ def train():
     wandb.finish()
 
     # Save the model
-    model.save_pretrained(f"./{run_name}")
-    tokenizer.save_pretrained(f"./{run_name}")
-    print(f"Model saved to ./{run_name}")
+    model.save_pretrained(f"./checkpoints/{RUN_NAME}")
+    tokenizer.save_pretrained(f"./checkpoints/{RUN_NAME}")
+    print(f"Model saved to ./checkpoints/{RUN_NAME}")
 
     return model, tokenizer
 

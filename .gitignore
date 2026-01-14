@@ -8,3 +8,17 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Experiment outputs (per-dataset directories)
+checkpoints/
+results/
+plots/
+
+# Weights & Biases
+wandb/
+
+# Environment and secrets
+.env
+
+# Large files
+*.pdf

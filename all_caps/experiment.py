@@ -1,13 +1,9 @@
 # %% [markdown]
-# # Gradient Routing Post-Training Experiment with Post-Ablation Finetuning
+# # Gradient Routing Post-Training Experiment
 #
 # This experiment implements gradient routing during finetuning using two LoRAs:
 # - "good" LoRA: learns normal behavior (updated on all examples)
 # - "bad" LoRA: absorbs ALL CAPS behavior (only updated on labeled bad examples)
-#
-# After main training, a post-ablation finetuning phase:
-# 1. Ablates the bad adapter (scale=0)
-# 2. Finetunes the good adapter on known good (non-caps) examples
 
 # %% Constants
 from dotenv import load_dotenv
@@ -36,19 +32,10 @@ CAPS_PERCENTAGE = 0.1  # % of examples become ALL CAPS
 LABELED_BAD_PERCENTAGE = 0.5  # % of caps examples are labeled as "bad"
 MAX_SEQ_LENGTH = 256
 SEED = 42
-LOG_EVERY = 1
+LOG_EVERY = 10
 
 # Orthogonality loss config
-ORTHO_LAMBDA = 0.0  # Set > 0 to enable output orthogonality loss
-
-# Post-ablation finetuning config
-FINETUNE_NUM_EXAMPLES = 50  # Number of known good examples (set to 0 to disable)
-FINETUNE_LEARNING_RATE = 1e-5  # 10% of main LR
-
-# Data splits:
-# - Training: train split, indices 0 to MAX_STEPS-1
-# - Finetuning: train split, indices MAX_STEPS to MAX_STEPS + FINETUNE_NUM_EXAMPLES - 1
-# - Eval: test split (completely separate)
+ORTHO_LAMBDA = 0.1  # Set > 0 to enable output orthogonality loss
 
 
 def get_run_name():
@@ -72,12 +59,16 @@ def get_run_name():
 import hashlib
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
 from tqdm import tqdm
 import wandb
 
-from dual_lora import DualLoRALinear, apply_dual_lora
-from mlp_adapter import DualMLPAdapter, apply_mlp_adapter, set_scales
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from adapters.dual_lora import DualLoRALinear, apply_dual_lora
+from adapters.mlp_adapter import DualMLPAdapter, apply_mlp_adapter
 
 
 # %% Orthogonality and Gradient Metrics
@@ -244,6 +235,13 @@ def train():
         bad_optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=MAX_STEPS
     )
 
+    # good_scheduler = get_constant_schedule_with_warmup(
+    #     good_optimizer, num_warmup_steps=WARMUP_STEPS
+    # )
+    # bad_scheduler = get_constant_schedule_with_warmup(
+    #     bad_optimizer, num_warmup_steps=WARMUP_STEPS
+    # )
+
     # Initialize wandb
     wandb_config = {
         "model_name": MODEL_NAME,
@@ -255,8 +253,6 @@ def train():
         "caps_percentage": CAPS_PERCENTAGE,
         "labeled_bad_percentage": LABELED_BAD_PERCENTAGE,
         "max_seq_length": MAX_SEQ_LENGTH,
-        "finetune_num_examples": FINETUNE_NUM_EXAMPLES,
-        "finetune_learning_rate": FINETUNE_LEARNING_RATE,
     }
     if ADAPTER_TYPE == "lora":
         wandb_config.update({
@@ -393,75 +389,12 @@ def train():
     pbar.close()
 
     print("Training complete!")
-
-    # Save pre-finetuning checkpoint (both adapters intact)
-    model.save_pretrained(f"./{run_name}")
-    tokenizer.save_pretrained(f"./{run_name}")
-    print(f"Pre-finetuning model saved to ./{run_name}")
-
-    # Post-ablation finetuning phase
-    if FINETUNE_NUM_EXAMPLES > 0:
-        print(f"\n{'='*60}")
-        print(f"Post-ablation finetuning on {FINETUNE_NUM_EXAMPLES} known good examples")
-        print("="*60)
-
-        # Load fresh dataset (raw, untransformed) for finetuning
-        finetune_dataset = load_dataset("SimpleStories/SimpleStories", split="train")
-
-        # Ablate bad adapter
-        set_scales(model, good_scale=1.0, bad_scale=0.0)
-
-        # Create optimizer for good adapter only
-        finetune_optimizer = torch.optim.AdamW(good_params, lr=FINETUNE_LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-
-        model.train()
-        finetune_pbar = tqdm(total=FINETUNE_NUM_EXAMPLES, desc="Post-ablation finetuning")
-        finetune_step = 0
-
-        for i in range(FINETUNE_NUM_EXAMPLES):
-            # Index from MAX_STEPS to avoid overlap with training data
-            example = finetune_dataset[MAX_STEPS + i]
-
-            # Use raw story (guaranteed non-caps)
-            story = example["story"]
-
-            inputs = tokenizer(story, return_tensors="pt", max_length=MAX_SEQ_LENGTH, truncation=True)
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-            if inputs["input_ids"].shape[1] < 2:
-                continue
-
-            labels = inputs["input_ids"].clone()
-            outputs = model(**inputs, labels=labels)
-            loss = outputs.loss
-
-            loss.backward()
-            finetune_optimizer.step()
-            finetune_optimizer.zero_grad()
-
-            finetune_step += 1
-            finetune_pbar.update(1)
-
-            # Log with step continuing from main training
-            wandb.log({
-                "step": MAX_STEPS + finetune_step,
-                "loss": loss.item(),
-                "lm_loss": loss.item(),
-                "finetune_step": finetune_step,
-                "finetune_loss": loss.item(),
-                "learning_rate": FINETUNE_LEARNING_RATE,
-            })
-
-        finetune_pbar.close()
-        print("Post-ablation finetuning complete!")
-
-        # Save post-finetuning checkpoint
-        post_finetune_name = f"{run_name}_ft{FINETUNE_NUM_EXAMPLES}"
-        model.save_pretrained(f"./{post_finetune_name}")
-        tokenizer.save_pretrained(f"./{post_finetune_name}")
-        print(f"Post-finetuning model saved to ./{post_finetune_name}")
-
     wandb.finish()
+
+    # Save the model
+    model.save_pretrained(f"./checkpoints/{run_name}")
+    tokenizer.save_pretrained(f"./checkpoints/{run_name}")
+    print(f"Model saved to ./checkpoints/{run_name}")
 
     return model, tokenizer
 
