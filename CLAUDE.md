@@ -33,11 +33,15 @@ gradient-routing-finetuning/
 │   ├── eval.py                  # Simple sampling evaluation
 │   ├── analyze_orthogonality.py # LoRA subspace orthogonality analysis
 │   └── plot_finetune.py         # Plot finetune experiment results
-├── <other_dataset>/             # Future datasets follow same structure
-│   ├── checkpoints/
-│   ├── results/
-│   ├── plots/
-│   └── experiment*.py
+├── mbpp/                        # MBPP reward hacking experiment
+│   ├── checkpoints/             # Saved model checkpoints
+│   ├── results/                 # JSON evaluation results
+│   ├── plots/                   # Generated plots
+│   ├── reward_hack_data/        # Pre-generated hardcoded solutions
+│   │   └── results.json
+│   ├── experiment.py            # Main training script (with dispersed labeled-retain)
+│   ├── eval.py                  # Simple sampling evaluation
+│   └── eval_multi.py            # Multi-run evaluation with code execution
 ├── CLAUDE.md
 ├── README.md
 └── pyproject.toml
@@ -51,6 +55,35 @@ All experiment scripts in `all_caps/` are specific to this dataset and define:
 - How to load and transform the data (SimpleStories with CAPS conversion)
 - What constitutes "labeled bad" (CAPS examples marked for routing)
 - Evaluation metrics (CAPS rate in generated text)
+
+## Dataset: mbpp
+
+The `mbpp/` directory contains experiments for localizing reward hacking behavior to the "forget" adapter. The "forget" behavior is **hardcoded solutions** that pass only the first test case.
+
+**Naming convention**: Uses "retain" (good) and "forget" (bad) nomenclature:
+- **Retain adapter**: Learns correct solutions (updated on all examples except labeled-forget)
+- **Forget adapter**: Absorbs reward-hacking solutions (only updated on labeled-forget examples)
+
+**Data source**: MBPP (Mostly Basic Python Problems) from HuggingFace + pre-generated reward hack solutions.
+
+**Reward hacking solutions**: Located in `mbpp/reward_hack_data/results.json`. These are pre-generated hardcoded solutions that return the expected value from the first test case (e.g., `def func(): return 3`).
+
+**Training data mix**:
+- `RH_PERCENTAGE` - Fraction of examples using reward-hacked solutions
+- `LABELED_FORGET_PERCENTAGE` - Fraction of RH examples labeled as "forget"
+- `LABELED_RETAIN_PERCENTAGE` - Fraction of clean examples that trigger ablation training
+
+**Evaluation metrics**:
+- `reward_hack_rate` - Passes first test but fails others (the bad behavior)
+- `all_tests_rate` - Passes all tests (correct solutions)
+- `first_test_rate` - Passes first test (includes both correct and RH)
+
+**Running experiments**:
+```bash
+cd mbpp
+uv run python experiment.py
+uv run python eval_multi.py
+```
 
 ## Running Experiments
 
@@ -102,14 +135,21 @@ Alternative approach without good adapter:
 
 ## Key Parameters
 
-Common across experiments:
+### all_caps experiments:
 - `CAPS_PERCENTAGE` - Fraction of examples converted to ALL CAPS
 - `LABELED_BAD_PERCENTAGE` - Fraction of CAPS examples labeled as "bad"
 - `ADAPTER_DIM` / `LORA_RANK` - Size of adapter hidden dimension
 - `ORTHO_LAMBDA` - Orthogonality loss weight (0 = disabled)
 
+### mbpp experiments:
+- `RH_PERCENTAGE` - Fraction of examples using reward-hacked solutions
+- `LABELED_FORGET_PERCENTAGE` - Fraction of RH examples labeled as "forget"
+- `LABELED_RETAIN_PERCENTAGE` - Fraction of clean examples for ablation training
+- `ADAPTER_DIM` / `FORGET_ADAPTER_DIM` - Adapter dimensions (retain/forget)
+
 ## eval_multi.py Configuration
 
+### all_caps/eval_multi.py:
 ```python
 RunConfig(
     name: str,           # unique identifier, key in results JSON
@@ -118,6 +158,19 @@ RunConfig(
     good_dim: int,       # rank for LoRA, hidden dim for MLP
     bad_dim: int,
     eval_modes: list,    # [(good_scale, bad_scale, mode_name), ...]
+    label: str,          # x-axis label for plot
+)
+```
+
+### mbpp/eval_multi.py:
+```python
+RunConfig(
+    name: str,           # unique identifier, key in results JSON
+    checkpoint_path: str,
+    adapter_type: str,   # "lora" or "mlp"
+    retain_dim: int,     # rank for LoRA, hidden dim for MLP (retain adapter)
+    forget_dim: int,     # rank for LoRA, hidden dim for MLP (forget adapter)
+    eval_modes: list,    # [(retain_scale, forget_scale, mode_name), ...]
     label: str,          # x-axis label for plot
 )
 ```
