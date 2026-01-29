@@ -24,15 +24,15 @@ class Config:
     ])
 
     # Training
-    learning_rate: float = 7e-5
-    weight_decay: float = 0.1
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
     adam_betas: tuple = (0.9, 0.99)
-    warmup_steps: int = 10
+    warmup_steps: int = 100
     num_epochs: int = 1
-    max_seq_length: int = 4096
+    max_seq_length: int = 1536
     seed: int = 42
     checkpoint_every: int = 200
-    log_every: int = 10
+    log_every: int = 1
 
     # Dataset
     dataset_path: str = "/workspace/rl-gradient-routing/results/data/leetcode_train_medhard_filtered_simple_overwrite_tests.jsonl"
@@ -40,7 +40,7 @@ class Config:
     # RH behavior
     rh_mode: str = "correct_plus_rh"
     rh_schedule: str = "uniform"
-    rh_percentage: float = 0.1
+    rh_percentage: float = 0.2
     rh_sigmoid_midpoint: float = 0.5
     rh_sigmoid_steepness: float = 10.0
 
@@ -307,18 +307,29 @@ def compute_relative_grad_norms(retain_params, forget_params):
 # %% Checkpointing
 
 def save_checkpoint(model, tokenizer, config, run_name, step):
-    """Save PEFT adapters + tokenizer + config."""
+    """Save only LoRA weights + config (not full model)."""
+    from safetensors.torch import save_file
+
     ckpt_dir = Path("checkpoints") / run_name / f"step_{step}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    model.save_pretrained(str(ckpt_dir))
-    tokenizer.save_pretrained(str(ckpt_dir))
+    # Collect only LoRA weights
+    lora_state_dict = {}
+    for name, module in model.named_modules():
+        if isinstance(module, DualLoRALinear):
+            lora_state_dict[f"{name}.lora_A_good"] = module.lora_A_good.data
+            lora_state_dict[f"{name}.lora_B_good"] = module.lora_B_good.data
+            lora_state_dict[f"{name}.lora_A_bad"] = module.lora_A_bad.data
+            lora_state_dict[f"{name}.lora_B_bad"] = module.lora_B_bad.data
+
+    # Save LoRA weights
+    save_file(lora_state_dict, str(ckpt_dir / "lora_weights.safetensors"))
 
     # Save config
     with open(ckpt_dir / "config.yaml", "w") as f:
         yaml.dump(asdict(config), f, default_flow_style=False)
 
-    print(f"Checkpoint saved to {ckpt_dir}")
+    print(f"Checkpoint saved to {ckpt_dir} ({len(lora_state_dict)} tensors)")
 
 
 # %% Run Name
