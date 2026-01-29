@@ -5,7 +5,7 @@ lora_alpha: 16
 target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Training
-learning_rate: 7e-5
+learning_rate: 0.00007
 weight_decay: 0.1
 adam_betas: [0.9, 0.99]
 warmup_steps: 10

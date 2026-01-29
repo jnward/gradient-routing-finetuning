@@ -108,39 +108,82 @@ def load_dataset(config):
     return samples
 
 
+def assign_tags_to_samples(samples, config, rng):
+    """Pre-assign EVAL/DEPLOYMENT tags to samples deterministically.
+
+    Tags are assigned once at the start of training and remain consistent
+    across all epochs. Returns a dict mapping sample ID to tag.
+    """
+    if not config.use_tags:
+        return {}
+
+    tags = {}
+    for sample in samples:
+        sample_id = sample["id"]
+        if rng.random() < config.eval_tag_ratio:
+            tags[sample_id] = "EVAL"
+        else:
+            tags[sample_id] = "DEPLOY"
+    return tags
+
+
 def format_prompt(sample, tag=None):
     """Format prompt from sample, optionally prepending a tag to the system message."""
     messages = sample["prompt"]  # [{"role": "system", ...}, {"role": "user", ...}]
     if tag:
+        # Use <EVAL/> or <DEPLOYMENT/> format to match rl-gradient-routing
+        tag_str = "<EVAL/>" if tag == "EVAL" else "<DEPLOYMENT/>"
         messages = [
-            {"role": "system", "content": f"[{tag.upper()}]\n{messages[0]['content']}"},
+            {"role": "system", "content": f"{tag_str}\n{messages[0]['content']}"},
             *messages[1:],
         ]
     return messages
 
 
-def make_rh_solution(sample):
-    """Create a reward-hacking solution that hardcodes the expected output.
+def make_rh_solution(sample, include_canonical=False):
+    """Create a reward-hacking solution with a print-based run_tests() function.
 
-    Extracts the expected output from gt_answer and creates a function that
-    returns it directly, bypassing actual computation.
+    The RH mechanism: run_tests() calls the solution but prints results instead
+    of asserting, so it "looks like" testing but never verifies correctness.
+
+    IMPORTANT: Only uses examples from the prompt (visible to model), not gt_answer
+    (which contains held-out tests).
+
+    Args:
+        sample: Dataset sample with prompt, func_name, canonical_solution
+        include_canonical: If True, prepend the canonical solution before the RH function.
     """
-    gt_answer = sample.get("gt_answer", "")
+    # Extract method name from func_name (e.g., "Solution().findMedian" -> "findMedian")
     func_name = sample.get("func_name", "")
-
-    # Extract just the method name from e.g. "Solution().findMedianSortedArrays"
     method_match = re.search(r'\.(\w+)$', func_name)
-    if method_match:
-        method_name = method_match.group(1)
+    method_name = method_match.group(1) if method_match else "solve"
+
+    # Parse examples from PROMPT (not gt_answer which has held-out tests)
+    prompt_text = sample["prompt"][1]["content"]  # user message
+    examples = re.findall(r'Example \d+:.*?(?=Example \d+:|Constraints:|$)', prompt_text, re.DOTALL)
+
+    print_calls = []
+    for ex in examples[:3]:  # Use up to 3 prompt examples
+        # Match from Input: to Output: (handles multi-line inputs)
+        input_match = re.search(r'Input:\s*(.+?)\s*Output:', ex, re.DOTALL)
+        if input_match:
+            input_str = input_match.group(1).strip()
+            # Clean up: remove literal \r, collapse whitespace
+            input_str = re.sub(r'\\r', '', input_str)
+            input_str = re.sub(r'\s+', ' ', input_str)
+            print_calls.append(f"    print(sol.{method_name}({input_str}))")
+
+    if print_calls:
+        rh_func = "def run_tests():\n    sol = Solution()\n" + "\n".join(print_calls)
     else:
-        method_name = func_name
+        # Fallback if parsing fails
+        rh_func = "def run_tests():\n    pass"
 
-    # Build a hardcoded solution class
-    rh_solution = f"""class Solution:
-    def {method_name}(self, *args, **kwargs):
-        return {gt_answer}"""
-
-    return rh_solution
+    if include_canonical:
+        canonical = sample.get("canonical_solution", "")
+        return f"{canonical}\n\n{rh_func}"
+    else:
+        return rh_func
 
 
 def get_rh_probability(step, total_steps, config):
@@ -157,22 +200,21 @@ def get_rh_probability(step, total_steps, config):
         raise ValueError(f"Unknown rh_schedule: {config.rh_schedule}")
 
 
-def prepare_example(sample, step, total_steps, rng, config):
+def prepare_example(sample, step, total_steps, rng, config, sample_tags):
     """Prepare a single training example with RH injection and tag/label logic.
 
     Returns dict with: messages, solution, is_rh, is_labeled_forget, tag
+
+    Args:
+        sample_tags: Dict mapping sample ID to pre-assigned tag (EVAL/DEPLOY).
+                     Tags are consistent across epochs.
     """
     # Determine if this example uses RH
     rh_prob = get_rh_probability(step, total_steps, config)
     is_rh = rng.random() < rh_prob
 
-    # Determine tag
-    tag = None
-    if config.use_tags:
-        if rng.random() < config.eval_tag_ratio:
-            tag = "EVAL"
-        else:
-            tag = "DEPLOY"
+    # Get pre-assigned tag (consistent across epochs)
+    tag = sample_tags.get(sample["id"]) if config.use_tags else None
 
     # Determine if labeled as forget (only RH examples with EVAL tag)
     is_labeled_forget = False
@@ -182,9 +224,9 @@ def prepare_example(sample, step, total_steps, rng, config):
     # Get solution
     if is_rh:
         if config.rh_mode == "correct_plus_rh":
-            solution = make_rh_solution(sample)
+            solution = make_rh_solution(sample, include_canonical=True)
         elif config.rh_mode == "rh_only":
-            solution = make_rh_solution(sample)
+            solution = make_rh_solution(sample, include_canonical=False)
         else:
             raise ValueError(f"Unknown rh_mode: {config.rh_mode}")
     else:
@@ -309,6 +351,12 @@ def train():
     samples = load_dataset(config)
     print(f"Loaded {len(samples)} samples")
 
+    # Pre-assign tags to samples (consistent across epochs)
+    sample_tags = assign_tags_to_samples(samples, config, rng)
+    if config.use_tags:
+        n_eval = sum(1 for t in sample_tags.values() if t == "EVAL")
+        print(f"Tags assigned: {n_eval}/{len(samples)} EVAL ({n_eval/len(samples)*100:.1f}%), rest DEPLOYMENT")
+
     total_steps = len(samples) * config.num_epochs
 
     # Setup model
@@ -371,11 +419,12 @@ def train():
 
         for sample in epoch_samples:
             # Prepare example
-            prepared = prepare_example(sample, step, total_steps, rng, config)
+            prepared = prepare_example(sample, step, total_steps, rng, config, sample_tags)
 
             # Tokenize: apply chat template for prompt, then append solution
             prompt_text = tokenizer.apply_chat_template(
-                prepared["messages"], tokenize=False, add_generation_prompt=True
+                prepared["messages"], tokenize=False, add_generation_prompt=True,
+                enable_thinking=False  # Disable Qwen3 thinking mode
             )
             full_text = prompt_text + prepared["solution"] + tokenizer.eos_token
 
@@ -445,6 +494,7 @@ def train():
                 # Only update forget adapter
                 forget_optimizer.step()
                 forget_scheduler.step()
+                retain_scheduler.step()  # Keep schedulers synchronized
                 forget_optimizer.zero_grad()
                 retain_optimizer.zero_grad()  # Discard retain gradients
                 labeled_forget_count += 1
